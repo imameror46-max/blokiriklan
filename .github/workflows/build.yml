@@ -1,0 +1,758 @@
+name: Build APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Tulis proyek
+        run: |
+          IMG=$(ls *.png *.PNG *.jpg *.jpeg 2>/dev/null | head -n1 || true)
+          mkdir -p proj/app/src/main/java/com/blokir/iklan proj/app/src/main/res/drawable-nodpi proj/app/src/main/res/xml proj/app/src/main/res/values
+          ICON=""
+          if [ -n "$IMG" ]; then
+            OUT=proj/app/src/main/res/drawable-nodpi/ic_launcher.png
+            convert "$IMG" -resize 192x192 "$OUT" || magick "$IMG" -resize 192x192 "$OUT" || cp "$IMG" "$OUT"
+            ICON='android:icon="@drawable/ic_launcher"'
+          fi
+          cd proj
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "BlokirIklan"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.blokir.iklan"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.blokir.iklan"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application
+                  android:allowBackup="false"
+                  android:label="Blokir Iklan"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".BlockVpnService"
+                      android:exported="false"
+                      android:permission="android.permission.BIND_VPN_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.net.VpnService" />
+                      </intent-filter>
+                  </service>
+                  <service
+                      android:name=".SkipService"
+                      android:exported="true"
+                      android:label="Blokir Iklan - Lewati Otomatis"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/skip_service" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/skip_service.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowContentChanged|typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagDefault"
+              android:canRetrieveWindowContent="true"
+              android:canPerformGestures="true"
+              android:notificationTimeout="300"
+              android:description="@string/skip_desc" />
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="skip_desc">Menekan tombol Lewati atau Tutup pada iklan secara otomatis, hanya di aplikasi yang kamu pilih. Layanan ini hanya mencari tombol tersebut dan tidak menyimpan atau mengirim isi layar.</string>
+          </resources>
+          EOF
+          cat > app/src/main/java/com/blokir/iklan/Store.kt <<'EOF'
+          package com.blokir.iklan
+
+          import android.content.Context
+          import android.content.SharedPreferences
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          class LogItem(val host: String, val blocked: Boolean)
+
+          object Store {
+              private var p: SharedPreferences? = null
+              private var dir: File? = null
+              @Volatile var running = false
+              @Volatile var version = 0
+              @Volatile var status = ""
+              @Volatile private var big: HashSet<String> = HashSet()
+              private val log = ArrayList<LogItem>()
+
+              private val defDomains = setOf("zi389vvu4j.com", "yy739vy33.com")
+              private val defKeywords = setOf("slot", "gacor", "togel", "judi", "maxwin", "st88")
+              private val aggressive = listOf("pangle.io", "pangleglobal.com", "pglstatp.com", "isnssdk.com", "byteoversea.com")
+              private val sources = listOf(
+                  "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling/hosts",
+                  "https://raw.githubusercontent.com/AdguardTeam/FiltersRegistry/master/filters/filter_15_DnsFilter/filter.txt"
+              )
+
+              fun init(c: Context) {
+                  if (p == null) {
+                      p = c.applicationContext.getSharedPreferences("blokir", Context.MODE_PRIVATE)
+                      dir = c.applicationContext.filesDir
+                      Thread { load() }.start()
+                  }
+              }
+
+              private fun get(k: String, d: Set<String>): Set<String> = HashSet(p!!.getStringSet(k, d) ?: d)
+              private fun put(k: String, s: Set<String>) { p!!.edit().putStringSet(k, s).apply(); version++ }
+
+              fun addDomain(d: String) { put("d", get("d", defDomains) + d) }
+              fun addKeyword(k: String) { put("k", get("k", defKeywords) + k) }
+              fun allow(d: String) {
+                  put("d", get("d", defDomains) - d)
+                  put("w", get("w", emptySet()) + d)
+              }
+
+              fun aggressiveOn(): Boolean = p!!.getBoolean("agg", false)
+              fun setAggressive(v: Boolean) { p!!.edit().putBoolean("agg", v).apply(); version++ }
+              fun bigSize(): Int = big.size
+              fun hasList(): Boolean = File(dir, "blocklist.txt").exists()
+
+              fun skipOn(): Boolean = p!!.getBoolean("skip", true)
+              fun setSkip(v: Boolean) { p!!.edit().putBoolean("skip", v).apply(); version++ }
+              fun apps(): Set<String>? {
+                  val s = p!!.getStringSet("apps", null)
+                  return if (s == null) null else HashSet(s)
+              }
+              fun setApps(s: Set<String>) { p!!.edit().putStringSet("apps", s).apply(); version++ }
+              fun appSelected(pkg: String): Boolean {
+                  val a = p!!.getStringSet("apps", null) ?: return false
+                  return a.contains(pkg)
+              }
+              fun statusText(): String = if (status.isNotEmpty()) status else "Daftar besar: ${big.size} domain"
+
+              fun isBlocked(h: String): Boolean {
+                  for (x in get("w", emptySet())) if (h == x || h.endsWith(".$x")) return false
+                  for (d in get("d", defDomains)) if (h == d || h.endsWith(".$d")) return true
+                  for (k in get("k", defKeywords)) if (h.contains(k)) return true
+                  if (aggressiveOn()) {
+                      for (d in aggressive) if (h == d || h.endsWith(".$d")) return true
+                  }
+                  val b = big
+                  var s = h
+                  while (true) {
+                      if (b.contains(s)) return true
+                      val i = s.indexOf('.')
+                      if (i < 0) break
+                      s = s.substring(i + 1)
+                  }
+                  return false
+              }
+
+              private fun load() {
+                  try {
+                      val f = File(dir, "blocklist.txt")
+                      if (!f.exists()) return
+                      val s = HashSet<String>()
+                      f.forEachLine { s.add(it) }
+                      big = s
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun ok(d: String): Boolean {
+                  if (!d.contains('.')) return false
+                  if (d.all { it.isDigit() || it == '.' }) return false
+                  for (ch in d) {
+                      if (!(ch.isLetterOrDigit() || ch == '.' || ch == '-' || ch == '_')) return false
+                  }
+                  return true
+              }
+
+              private fun parseLine(line: String): String? {
+                  val t = line.trim()
+                  if (t.isEmpty() || t.startsWith("#") || t.startsWith("!")) return null
+                  if (t.startsWith("||")) {
+                      val body = t.substring(2)
+                      val i = body.indexOf('^')
+                      if (i < 0) return null
+                      val rest = body.substring(i + 1)
+                      if (rest.isNotEmpty() && rest != "\$important") return null
+                      val d = body.substring(0, i).lowercase()
+                      return if (ok(d)) d else null
+                  }
+                  val parts = t.split(Regex("\\s+"))
+                  if (parts.size < 2) return null
+                  val d = parts[1].lowercase()
+                  return if (ok(d)) d else null
+              }
+
+              fun update() {
+                  Thread {
+                      status = "Mengunduh daftar..."
+                      version++
+                      val s = HashSet<String>()
+                      var gagal = 0
+                      for (u in sources) {
+                          try {
+                              val c = URL(u).openConnection() as HttpURLConnection
+                              c.connectTimeout = 15000
+                              c.readTimeout = 60000
+                              c.inputStream.bufferedReader().useLines { lines ->
+                                  for (line in lines) {
+                                      val d = parseLine(line)
+                                      if (d != null) s.add(d)
+                                  }
+                              }
+                          } catch (e: Exception) {
+                              gagal++
+                          }
+                      }
+                      if (s.size > 1000 && (gagal == 0 || big.isEmpty())) {
+                          try {
+                              File(dir, "blocklist.txt").bufferedWriter().use { w ->
+                                  for (d in s) { w.write(d); w.newLine() }
+                              }
+                              big = s
+                              status = "Daftar diperbarui: ${s.size} domain"
+                          } catch (e: Exception) {
+                              status = "Gagal menyimpan daftar"
+                          }
+                      } else {
+                          status = "Gagal mengunduh daftar (cek internet)"
+                      }
+                      version++
+                  }.start()
+              }
+
+              fun addLog(h: String, b: Boolean) {
+                  synchronized(log) {
+                      val it = log.iterator()
+                      while (it.hasNext()) { if (it.next().host == h) it.remove() }
+                      log.add(0, LogItem(h, b))
+                      while (log.size > 300) log.removeAt(log.size - 1)
+                      version++
+                  }
+              }
+
+              fun snapshot(): List<LogItem> = synchronized(log) { ArrayList(log) }
+          }
+          EOF
+          cat > app/src/main/java/com/blokir/iklan/BlockVpnService.kt <<'EOF'
+          package com.blokir.iklan
+
+          import android.content.Intent
+          import android.net.VpnService
+          import android.os.ParcelFileDescriptor
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.net.DatagramPacket
+          import java.net.DatagramSocket
+          import java.net.InetAddress
+          import java.util.concurrent.Executors
+
+          class BlockVpnService : VpnService() {
+              private var tun: ParcelFileDescriptor? = null
+              @Volatile private var active = false
+              private val pool = Executors.newFixedThreadPool(8)
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  Store.init(this)
+                  if (intent?.action == "STOP") { shutdown(); return START_NOT_STICKY }
+                  startVpn()
+                  return START_STICKY
+              }
+
+              private fun startVpn() {
+                  if (active) return
+                  val fd = Builder()
+                      .setSession("Blokir Iklan")
+                      .addAddress("10.111.0.1", 32)
+                      .addDnsServer("10.111.0.2")
+                      .addRoute("10.111.0.2", 32)
+                      .setBlocking(true)
+                      .establish() ?: return
+                  tun = fd
+                  active = true
+                  Store.running = true
+                  Thread { loop(fd) }.start()
+              }
+
+              private fun loop(fd: ParcelFileDescriptor) {
+                  val inp = FileInputStream(fd.fileDescriptor)
+                  val out = FileOutputStream(fd.fileDescriptor)
+                  val buf = ByteArray(32767)
+                  try {
+                      while (active) {
+                          val n = inp.read(buf)
+                          if (n < 0) break
+                          if (n < 28) continue
+                          if ((buf[0].toInt() shr 4) != 4) continue
+                          val ihl = (buf[0].toInt() and 0x0F) * 4
+                          if (buf[9].toInt() != 17 || n < ihl + 8 + 12) continue
+                          val dport = ((buf[ihl + 2].toInt() and 0xFF) shl 8) or (buf[ihl + 3].toInt() and 0xFF)
+                          if (dport != 53) continue
+                          val pkt = buf.copyOf(n)
+                          pool.execute { handle(pkt, ihl, out) }
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun handle(pkt: ByteArray, ihl: Int, out: FileOutputStream) {
+                  val dns = pkt.copyOfRange(ihl + 8, pkt.size)
+                  val host = qname(dns) ?: return
+                  if (Store.isBlocked(host)) {
+                      Store.addLog(host, true)
+                      dns[2] = 0x81.toByte()
+                      dns[3] = 0x83.toByte()
+                      reply(pkt, ihl, dns, out)
+                  } else {
+                      Store.addLog(host, false)
+                      forward(pkt, ihl, dns, out)
+                  }
+              }
+
+              private fun forward(pkt: ByteArray, ihl: Int, dns: ByteArray, out: FileOutputStream) {
+                  try {
+                      DatagramSocket().use { s ->
+                          protect(s)
+                          s.soTimeout = 4000
+                          s.connect(InetAddress.getByName("1.1.1.1"), 53)
+                          s.send(DatagramPacket(dns, dns.size))
+                          val rb = ByteArray(4096)
+                          val rp = DatagramPacket(rb, rb.size)
+                          s.receive(rp)
+                          reply(pkt, ihl, rb.copyOf(rp.length), out)
+                      }
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun qname(d: ByteArray): String? {
+                  var i = 12
+                  val sb = StringBuilder()
+                  while (i < d.size) {
+                      val l = d[i].toInt() and 0xFF
+                      if (l == 0) break
+                      if (l > 63 || i + 1 + l > d.size) return null
+                      if (sb.isNotEmpty()) sb.append('.')
+                      sb.append(String(d, i + 1, l, Charsets.US_ASCII))
+                      i += l + 1
+                  }
+                  return if (sb.isEmpty()) null else sb.toString().lowercase()
+              }
+
+              private fun reply(req: ByteArray, ihl: Int, dns: ByteArray, out: FileOutputStream) {
+                  val total = ihl + 8 + dns.size
+                  val o = ByteArray(total)
+                  System.arraycopy(req, 0, o, 0, ihl + 8)
+                  System.arraycopy(req, 16, o, 12, 4)
+                  System.arraycopy(req, 12, o, 16, 4)
+                  o[ihl] = req[ihl + 2]; o[ihl + 1] = req[ihl + 3]
+                  o[ihl + 2] = req[ihl]; o[ihl + 3] = req[ihl + 1]
+                  o[2] = (total shr 8).toByte(); o[3] = total.toByte()
+                  o[8] = 64
+                  o[10] = 0; o[11] = 0
+                  val udpLen = 8 + dns.size
+                  o[ihl + 4] = (udpLen shr 8).toByte(); o[ihl + 5] = udpLen.toByte()
+                  o[ihl + 6] = 0; o[ihl + 7] = 0
+                  System.arraycopy(dns, 0, o, ihl + 8, dns.size)
+                  var sum = 0
+                  var i = 0
+                  while (i < ihl) {
+                      sum += ((o[i].toInt() and 0xFF) shl 8) or (o[i + 1].toInt() and 0xFF)
+                      i += 2
+                  }
+                  while ((sum shr 16) != 0) sum = (sum and 0xFFFF) + (sum shr 16)
+                  val cs = sum.inv() and 0xFFFF
+                  o[10] = (cs shr 8).toByte(); o[11] = cs.toByte()
+                  synchronized(out) { out.write(o) }
+              }
+
+              private fun shutdown() {
+                  active = false
+                  Store.running = false
+                  try { tun?.close() } catch (_: Exception) {}
+                  tun = null
+                  stopSelf()
+              }
+
+              override fun onRevoke() { shutdown() }
+              override fun onDestroy() { shutdown(); super.onDestroy() }
+          }
+          EOF
+          cat > app/src/main/java/com/blokir/iklan/SkipService.kt <<'EOF'
+          package com.blokir.iklan
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.graphics.Rect
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+
+          class SkipService : AccessibilityService() {
+              companion object {
+                  @Volatile var connected = false
+              }
+
+              private val h = Handler(Looper.getMainLooper())
+              private var pending = false
+              private var last = 0L
+              private var budget = 0
+
+              private val exact = setOf(
+                  "lewati", "lewati iklan", "skip", "skip ad", "skip ads", "skip all", "skip video",
+                  "tutup iklan", "close ad", "close ads", "tutup", "close", "x", "×", "✕", "✖"
+              )
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  Store.init(this)
+                  connected = true
+              }
+
+              override fun onUnbind(intent: Intent?): Boolean {
+                  connected = false
+                  return super.onUnbind(intent)
+              }
+
+              override fun onInterrupt() {}
+
+              override fun onAccessibilityEvent(e: AccessibilityEvent?) {
+                  if (e == null || pending) return
+                  if (!Store.skipOn()) return
+                  val pkg = e.packageName?.toString() ?: return
+                  if (!Store.appSelected(pkg)) return
+                  pending = true
+                  h.postDelayed({
+                      pending = false
+                      scan(pkg)
+                  }, 500)
+              }
+
+              private fun scan(pkg: String) {
+                  val now = System.currentTimeMillis()
+                  if (now - last < 1500) return
+                  val root = rootInActiveWindow ?: return
+                  if (root.packageName?.toString() != pkg) return
+                  budget = 3000
+                  val n = find(root, 0) ?: return
+                  if (click(n)) last = now
+              }
+
+              private fun find(n: AccessibilityNodeInfo?, depth: Int): AccessibilityNodeInfo? {
+                  if (n == null || depth > 40 || budget-- <= 0) return null
+                  if (n.isVisibleToUser) {
+                      val t = (n.text?.toString() ?: n.contentDescription?.toString() ?: "").trim().lowercase()
+                      if (t.isNotEmpty() && t.length <= 15 && match(t)) return n
+                  }
+                  for (i in 0 until n.childCount) {
+                      val r = find(n.getChild(i), depth + 1)
+                      if (r != null) return r
+                  }
+                  return null
+              }
+
+              private fun match(t: String): Boolean {
+                  if (exact.contains(t)) return true
+                  return (t.startsWith("skip") || t.startsWith("lewati")) && t.length <= 12
+              }
+
+              private fun click(n: AccessibilityNodeInfo): Boolean {
+                  var c: AccessibilityNodeInfo? = n
+                  var up = 0
+                  while (c != null && up < 5) {
+                      if (c.isClickable && c.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+                      c = c.parent
+                      up++
+                  }
+                  val r = Rect()
+                  n.getBoundsInScreen(r)
+                  if (r.width() <= 0 || r.height() <= 0) return false
+                  val path = Path()
+                  path.moveTo(r.exactCenterX(), r.exactCenterY())
+                  val g = GestureDescription.Builder()
+                      .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
+                      .build()
+                  return dispatchGesture(g, null, null)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/blokir/iklan/MainActivity.kt <<'EOF'
+          package com.blokir.iklan
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.ResolveInfo
+          import android.net.VpnService
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ListView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var btn: Button
+              private lateinit var agg: Button
+              private lateinit var skip: Button
+              private lateinit var st: TextView
+              private lateinit var st2: TextView
+              private lateinit var adapter: ArrayAdapter<String>
+              private var items: List<LogItem> = emptyList()
+              private var seen = -1
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun w() = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+
+              private fun launcherApps(): List<ResolveInfo> {
+                  val i = Intent(Intent.ACTION_MAIN)
+                  i.addCategory(Intent.CATEGORY_LAUNCHER)
+                  return packageManager.queryIntentActivities(i, 0)
+              }
+
+              private fun defaultApps(): Set<String> {
+                  val known = setOf(
+                      "com.android.chrome", "org.mozilla.firefox", "org.mozilla.fenix", "com.brave.browser",
+                      "com.opera.browser", "com.opera.mini.native", "com.sec.android.app.sbrowser",
+                      "com.microsoft.emmx", "com.kiwibrowser.browser", "org.chromium.chrome",
+                      "com.duckduckgo.mobile.android", "com.UCMobile.intl"
+                  )
+                  val s = HashSet<String>()
+                  for (ri in launcherApps()) {
+                      val pkg = ri.activityInfo.packageName
+                      val label = ri.loadLabel(packageManager).toString().lowercase()
+                      if (known.contains(pkg) || label.contains("melolo")) s.add(pkg)
+                  }
+                  return s
+              }
+
+              private fun pickApps() {
+                  val list = launcherApps()
+                      .filter { it.activityInfo.packageName != packageName }
+                      .distinctBy { it.activityInfo.packageName }
+                      .sortedBy { it.loadLabel(packageManager).toString().lowercase() }
+                  val names = list.map { it.loadLabel(packageManager).toString() }.toTypedArray()
+                  val pkgs = list.map { it.activityInfo.packageName }
+                  val sel: Set<String> = Store.apps() ?: HashSet<String>()
+                  val checked = BooleanArray(pkgs.size) { sel.contains(pkgs[it]) }
+                  AlertDialog.Builder(this)
+                      .setTitle("Aplikasi untuk lewati otomatis")
+                      .setMultiChoiceItems(names, checked) { _, which, isChecked -> checked[which] = isChecked }
+                      .setPositiveButton("Simpan") { _, _ ->
+                          val n = HashSet<String>()
+                          for (i in pkgs.indices) if (checked[i]) n.add(pkgs[i])
+                          Store.setApps(n)
+                      }
+                      .setNegativeButton("Batal", null)
+                      .show()
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  Store.init(this)
+                  if (!Store.hasList()) Store.update()
+                  if (Store.apps() == null) Store.setApps(defaultApps())
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(16), dp(32), dp(16), dp(8))
+
+                  val info = TextView(this)
+                  info.text = "Berlaku untuk semua aplikasi dan browser. Matikan DNS Pribadi di Pengaturan " +
+                      "dan DNS aman di Chrome dulu. Tap domain di daftar untuk memblokir atau mengizinkannya."
+                  root.addView(info)
+
+                  btn = Button(this)
+                  btn.setOnClickListener { toggle() }
+                  root.addView(btn)
+
+                  val row2 = LinearLayout(this)
+                  val upd = Button(this)
+                  upd.text = "Perbarui daftar"
+                  upd.setOnClickListener { Store.update() }
+                  agg = Button(this)
+                  agg.setOnClickListener {
+                      Store.setAggressive(!Store.aggressiveOn())
+                      if (Store.aggressiveOn()) {
+                          Toast.makeText(this, "Jika Melolo error, matikan lagi mode agresif", Toast.LENGTH_LONG).show()
+                      }
+                  }
+                  row2.addView(upd, w())
+                  row2.addView(agg, w())
+                  root.addView(row2)
+
+                  st = TextView(this)
+                  root.addView(st)
+
+                  val row3 = LinearLayout(this)
+                  skip = Button(this)
+                  skip.setOnClickListener { Store.setSkip(!Store.skipOn()) }
+                  val pick = Button(this)
+                  pick.text = "Pilih aplikasi"
+                  pick.setOnClickListener { pickApps() }
+                  row3.addView(skip, w())
+                  row3.addView(pick, w())
+                  root.addView(row3)
+
+                  val acc = Button(this)
+                  acc.text = "Aktifkan layanan lewati otomatis"
+                  acc.setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  root.addView(acc)
+
+                  st2 = TextView(this)
+                  root.addView(st2)
+
+                  val row = LinearLayout(this)
+                  val input = EditText(this)
+                  input.hint = "domain atau kata kunci"
+                  input.setSingleLine()
+                  val add = Button(this)
+                  add.text = "Blokir"
+                  add.setOnClickListener {
+                      val t = input.text.toString().trim().lowercase()
+                      if (t.isNotEmpty()) {
+                          if (t.contains('.')) Store.addDomain(t) else Store.addKeyword(t)
+                          input.setText("")
+                          Toast.makeText(this, "Ditambahkan: $t", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  row.addView(input, w())
+                  row.addView(add)
+                  root.addView(row)
+
+                  val list = ListView(this)
+                  adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, ArrayList<String>())
+                  list.adapter = adapter
+                  list.setOnItemClickListener { _, _, pos, _ ->
+                      if (pos < items.size) askItem(items[pos])
+                  }
+                  root.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
+                  setContentView(root)
+              }
+
+              private fun askItem(it: LogItem) {
+                  val d = AlertDialog.Builder(this).setNegativeButton("Batal", null)
+                  if (!it.blocked) {
+                      d.setMessage("Blokir ${it.host}?")
+                      d.setPositiveButton("Blokir") { _, _ -> Store.addDomain(it.host) }
+                  } else {
+                      d.setMessage("Izinkan ${it.host}?")
+                      d.setPositiveButton("Izinkan") { _, _ -> Store.allow(it.host) }
+                  }
+                  d.show()
+              }
+
+              private fun toggle() {
+                  if (Store.running) {
+                      val i = Intent(this, BlockVpnService::class.java)
+                      i.action = "STOP"
+                      startService(i)
+                  } else {
+                      val p = VpnService.prepare(this)
+                      if (p != null) startActivityForResult(p, 1) else startVpn()
+                  }
+              }
+
+              private fun startVpn() { startService(Intent(this, BlockVpnService::class.java)) }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  if (req == 1 && res == RESULT_OK) startVpn()
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() { refresh(); h.postDelayed(this, 800) }
+              }
+
+              override fun onResume() { super.onResume(); tick.run() }
+              override fun onPause() { super.onPause(); h.removeCallbacks(tick) }
+
+              private fun refresh() {
+                  btn.text = if (Store.running) "Matikan pemblokir" else "Nyalakan pemblokir"
+                  agg.text = if (Store.aggressiveOn()) "Agresif: nyala" else "Agresif: mati"
+                  skip.text = if (Store.skipOn()) "Lewati: nyala" else "Lewati: mati"
+                  st.text = Store.statusText()
+                  st2.text = if (SkipService.connected) "Layanan lewati otomatis: aktif" else "Layanan lewati otomatis: belum aktif"
+                  if (seen != Store.version) {
+                      seen = Store.version
+                      items = Store.snapshot()
+                      adapter.clear()
+                      adapter.addAll(items.map { (if (it.blocked) "⛔ " else "✅ ") + it.host })
+                  }
+              }
+          }
+          EOF
+          sed -i "s|android:allowBackup=\"false\"|android:allowBackup=\"false\" $ICON|" app/src/main/AndroidManifest.xml
+      - name: Build
+        working-directory: proj
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlokirIklan-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
